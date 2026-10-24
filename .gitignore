@@ -1,0 +1,18 @@
+node_modules/
+generated-images/
+_diag/
+*.log
+
+# 运行时数据：密钥、模型表、生成索引 —— 绝不该进仓库
+.env
+.env.*
+!.env.example
+models.json
+index.json
+*.tmp
+
+# 测试产物
+test-output/
+*.png
+*.jpg
+*.webp

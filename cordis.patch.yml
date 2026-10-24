@@ -1,0 +1,22 @@
+# dsh-image-gen 的 bundle patch：安装本包后自动挂载宿主半。
+#
+# ⚠️ 开源版不带任何服务商默认值：baseUrl / model 必须由使用者自己填。
+#    apiKeyEnv 指向 ~/.dsh/.env（或进程环境变量）里的密钥变量名；
+#    optimizer 留空 = 提示词优化跟随当前会话模型；size/ratio 是默认档位。
+- insert:
+    - id: image-gen
+      name: dsh-image-gen
+      config:
+        apiKeyEnv: IMAGE_API_KEY
+        baseUrl: ""            # 必填：你的图像 API 地址，例如 https://your-image-api.example.com
+        model: ""              # 必填：该服务上的模型名
+        size: 2K
+        ratio: 1:1
+        count: 1
+        timeoutMs: 300000
+        optimize: true
+        optimizer:
+          provider: ""
+          model: ""
+        saveFiles: true
+        saveDir: generated-images

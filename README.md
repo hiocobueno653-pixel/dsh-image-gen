@@ -48,6 +48,11 @@ model: your-model-name                          # 该服务上的模型名
 
 不需要 `/img` 之类的命令（斜杠命令已移除）。尺寸档位与宽高比由模型从你的话里取，默认 `2K` + `1:1`。
 
+## 演示
+
+- 演示视频（MP4，约 36 秒）：[assets/demo-generate-image.mp4](assets/demo-generate-image.mp4)
+- 内容：说一句话生成沙滩图片 → GridReveal 动画 → 显影出图。
+
 ## 生图不是消息：这一轮的 Turn 尾卡片
 
 **图片不画在工具行里。** 它渲染在**该轮的 Turn 尾**——`conversation.chat.turnTail` 席位，

@@ -44,9 +44,23 @@ model: your-model-name                          # 该服务上的模型名
 画一张：一只趴在窗台的橘猫，午后阳光
 只生成图片：赛博朋克雨夜街道，霓虹倒影
 给我配一张产品海报图，玻璃立方体在白色影棚里，16:9
+把这张图改成日落（基于会话里最新一张图改）
 ```
 
 不需要 `/img` 之类的命令（斜杠命令已移除）。尺寸档位与宽高比由模型从你的话里取，默认 `2K` + `1:1`。
+
+### 改图 / 图生图
+
+说「把这张图改成…」「换成…风格」时，模型会给 `generate_image` 带上 `reference_images`：
+
+| 取值 | 含义 |
+| --- | --- |
+| `["latest"]` | 当前会话里**最新一条带图消息**中的图片（通常就是上一张生成或上传的图） |
+| `["<attachmentId>"]` | 会话里指定那张图（id 见工具结果/附件引用） |
+
+限制：最多 4 张、单张 ≤ 8MB；只读当前会话里已存在的图片（不读工作区任意路径、不接受 URL）。
+找不到图会**直接报错**，不会静默退回文生图 —— 你说的就是"改这张"。
+参考图以 `data:` URI 放进请求（`extra_body.image` / OpenAI 兼容的 `image`），由服务端决定支持程度。
 
 ## 演示
 
@@ -243,7 +257,7 @@ rareui 只解决"格子怎么裂开"，出图那一下是硬淡入。[bencho 的
 | `optimizer.provider` / `.model` | 空 | 留空 = 跟随当前会话的模型；填了就固定用它。**设置页选过的会覆盖这两项** |
 | `optimizeTimeoutMs` | `8000` | 增强超时。超时即跳过、回退原文，绝不把等待翻倍 |
 | `optimizeTemperature` / `optimizeMaxTokens` | `0.7` / `700` | 创意外扩与结构稳定的折中 |
-| `saveFiles` / `saveDir` | `true` / `generated-images` | 是否把图存到会话工作区，存到哪个子目录 |
+| `saveFiles` / `saveDir` | `true` / `generated-images` | 是否把图存到会话工作区、存到哪个子目录。`saveDir` **必须留在工作区内**（`../x`、绝对路径会被拒绝并跳过落盘） |
 | `timeoutMs` | `300000` | 单次请求超时（多数服务建议 60–360s） |
 
 ## 提示词前置增强（Prompt Optimizer Interceptor）
@@ -314,9 +328,20 @@ rareui 只解决"格子怎么裂开"，出图那一下是硬淡入。[bencho 的
   编辑时密钥框留空 = 保持原值不变。内置行（`default`）也可编辑/换 key，
   改它会落一条 `builtin:true` 的覆盖记录，由 `listRaw()` 与配置派生值合并。
 
+## 错误处理与密钥安全
+
+- **密钥脱敏**：上游与中转站经常把 `Authorization` 头原样回显在错误体里。所有会进对话或日志的错误文本，
+  抛出前统一过 `redactSecrets()`：已知密钥逐字替换，并兜底打码 `sk-…` / `AIza…` / `Bearer …` / `api_key=…` 这类形状。
+- **超时与取消分开**：生成由插件自己的看门狗计时。超时抛「生图超时…上游可能已扣费或仍在生成」，
+  用户主动取消单独归为 `ABORTED`，不会混成一句“网络失败”。
+- **传输诊断**：`fetch failed` 会展开 `error.cause` 链并带上阶段与耗时，例如
+  `图像 API 请求 failed after 3.2s: TypeError: fetch failed <- Error [UND_ERR_SOCKET]: other side closed`，
+  便于判断是代理、DNS 还是上游断开。
+
 ## 数据落点
 
-- 图片文件：`<会话工作区>/generated-images/<时间戳>-<提示词 slug>.png`
+- 图片文件：`<会话工作区>/generated-images/<时间戳>-<提示词 slug>.png`（同目录临时文件 + `rename` 原子落位；
+  同一秒撞名自动加序号，绝不覆盖已有图）
 - 附件：`ctx.attachments.saveImage()`（内容寻址，随会话持久化；工具结果里以 image 块返回，宿主画廊据此加载）
 - 结果索引：`$DSH_HOME/cache/dsh-image-gen/index.json`（callId → 提示词/优化结果/附件/文件，保留最近 300 条）
 - 图片字节路由（画廊之外的兜底）：`GET /image-gen/raw/<callId>/<index>`（宿主 `webServer` 注册，同源、仅本机）
@@ -324,7 +349,7 @@ rareui 只解决"格子怎么裂开"，出图那一下是硬淡入。[bencho 的
 ## 验证
 
 ```bash
-npm test            # 7 个离线测试：栅栏 / 注册表 / 图像客户端 / 提示词增强 / 宿主管理 / 宿主全链路 / 客户端结构
+npm test            # 8 个离线测试：栅栏 / 注册表 / 图像客户端 / 脱敏与诊断 / 提示词增强 / 宿主管理 / 宿主全链路 / 客户端结构
 npm run test:browser   # 4 个真 Chromium 测试（需要 `npm i` 拉 playwright，或用 CHROME_PATH 指定本机 Chrome）
 ```
 

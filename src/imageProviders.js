@@ -10,6 +10,8 @@
  */
 import { generateImages, ImageApiError, assertBaseUrl } from './imageApi.js';
 import { IMAGE_RATIOS } from './imageApi.js';
+import { redactSecrets } from './redact.js';
+import { GenerationTimeoutError, transportFailure, withGenerationTimeout } from './diagnostics.js';
 
 /* 比例 → 1K 档像素。2K/3K/4K 按边长倍率放大（线性档位，不是面积倍率），
    否则用户选 4K 仍只拿到 1024 档，和设置页显示的不符。 */
@@ -72,34 +74,45 @@ export function normalizeImageRows(json) {
 }
 
 async function post(url, { apiKey, body, timeoutMs, signal, fetchImpl }) {
-  const timeout = AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined;
-  const composed = signal && timeout && AbortSignal.any ? AbortSignal.any([signal, timeout]) : signal || timeout;
+  const startedAt = Date.now();
   let response;
   try {
-    response = await fetchImpl(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-      },
-      body: JSON.stringify(body),
-      signal: composed,
-    });
+    response = await withGenerationTimeout(timeoutMs, signal, combined =>
+      fetchImpl(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify(body),
+        signal: combined,
+      }),
+    );
   } catch (error) {
     if (error instanceof ImageApiError) throw error;
-    if (error?.name === 'TimeoutError') throw new ImageApiError(`请求超时（${timeoutMs} ms）`, { code: 'TIMEOUT' });
+    if (error instanceof GenerationTimeoutError || error?.name === 'TimeoutError') {
+      throw new ImageApiError(error.message || `请求超时（${timeoutMs} ms）`, { code: 'TIMEOUT' });
+    }
+    if (signal?.aborted) throw new ImageApiError('请求已取消', { code: 'ABORTED' });
     if (error?.name === 'AbortError') throw new ImageApiError('请求已取消', { code: 'ABORTED' });
-    throw new ImageApiError(`请求失败：${error?.message || error}`, { code: 'NETWORK' });
+    throw new ImageApiError(transportFailure('模型服务请求', startedAt, error, signal, [apiKey]).message, { code: 'NETWORK' });
   }
-  const text = await response.text();
+  let text;
+  try {
+    text = await response.text();
+  } catch (error) {
+    if (signal?.aborted) throw new ImageApiError('请求已取消', { code: 'ABORTED' });
+    throw new ImageApiError(transportFailure('读取响应', startedAt, error, signal, [apiKey]).message, { code: 'NETWORK' });
+  }
   let json;
   try {
     json = text ? JSON.parse(text) : {};
   } catch {
-    throw new ImageApiError(`响应不是 JSON（HTTP ${response.status}）：${text.slice(0, 300)}`, { status: response.status, code: 'BAD_JSON' });
+    throw new ImageApiError(`响应不是 JSON（HTTP ${response.status}）：${redactSecrets(text.slice(0, 300), apiKey)}`, { status: response.status, code: 'BAD_JSON' });
   }
   if (!response.ok) {
-    const detail = json?.error?.message || json?.message || text.slice(0, 300);
+    /* 中转站常把含 key 的请求头回显在错误体里 —— 进对话前打码 */
+    const detail = redactSecrets(String(json?.error?.message || json?.message || text.slice(0, 300)), apiKey);
     throw new ImageApiError(`模型服务返回 HTTP ${response.status}：${detail}`, { status: response.status, code: 'HTTP_ERROR', body: json });
   }
   return json;

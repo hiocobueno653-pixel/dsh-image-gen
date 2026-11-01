@@ -1,9 +1,9 @@
 {
   "name": "dsh-image-gen",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "DSH 生图插件：generate_image 工具（提示词自动增强 → 出图，聊天里只留 GridReveal 动画与图片）+ Turn 尾图片卡片",
+  "description": "DSH 生图插件：generate_image 工具（提示词自动增强 → 出图 / 基于会话图片改图，聊天里只留 GridReveal 动画与图片）+ Turn 尾图片卡片",
   "license": "MIT",
   "author": "hiocobueno653-pixel",
   "homepage": "https://github.com/hiocobueno653-pixel/dsh-image-gen#readme",
@@ -36,7 +36,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/fence.test.mjs && node test/imageModels.test.mjs && node test/imageApi.test.mjs && node test/promptOptimizer.test.mjs && node test/hostModels.test.mjs && node test/host.test.mjs && node test/client.test.mjs",
+    "test": "node test/fence.test.mjs && node test/imageModels.test.mjs && node test/imageApi.test.mjs && node test/diagnostics.test.mjs && node test/promptOptimizer.test.mjs && node test/hostModels.test.mjs && node test/host.test.mjs && node test/client.test.mjs",
     "test:browser": "node test/box-ratio.browser.test.mjs && node test/develop.browser.test.mjs && node test/navIcon.browser.test.mjs && node test/scope.browser.test.mjs"
   },
   "devDependencies": {

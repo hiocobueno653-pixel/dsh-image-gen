@@ -8,7 +8,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyCordis } from '../src/cordis.js';
+import { applyCordis, resolveSaveDir } from '../src/cordis.js';
 
 let failures = 0;
 const check = (name, ok, detail) => {
@@ -62,7 +62,23 @@ const fakeCtx = {
     if (name === 'tools') return { register: def => { registeredTool = def; return () => {}; } };
     if (name === 'webServer') return { register: route => { registeredRoute = route; return () => {}; } };
     if (name === 'sessions') {
-      return { get: () => ({ header: { cwd: workDir }, requestHeader: () => ({ config: { provider: 'fake', model: 'fake-model' } }) }) };
+      return {
+        get: () => ({
+          header: { cwd: workDir },
+          requestHeader: () => ({ config: { provider: 'fake', model: 'fake-model' } }),
+          /* 会话里已有一张图：参考图解析走它 */
+          deriveMessages: () => [
+            { source: { kind: 'user' }, content: [{ type: 'text', text: '把这张图改成日落' }] },
+            {
+              source: { kind: 'assistant' },
+              content: [
+                { type: 'text', text: '好的' },
+                { type: 'image', attachment: { attachmentId: 'att-ref-1', mediaType: 'image/png', bytes: PNG.length, width: 1, height: 1 } },
+              ],
+            },
+          ],
+        }),
+      };
     }
     if (name === 'attachments') {
       return {
@@ -74,8 +90,9 @@ const fakeCtx = {
         },
         readImage: async ref => {
           const hit = saved.find(s => s.ref.attachmentId === ref.attachmentId);
-          if (!hit) throw new Error('attachment not found');
-          return { ref: hit.ref, data: hit.data };
+          if (hit) return { ref: hit.ref, data: hit.data };
+          if (String(ref.attachmentId) === 'att-ref-1') return { ref: { ...ref, mediaType: 'image/png' }, data: new Uint8Array(PNG) };
+          throw new Error('attachment not found');
         },
       };
     }
@@ -90,7 +107,7 @@ const fakeCtx = {
 const service = applyCordis(fakeCtx, { baseUrl: 'https://image.test', model: 'test-model', apiKeyEnv: 'IGM_TEST_KEY', size: '1K', ratio: '1:1' });
 check('generate_image 工具已注册', !!registeredTool && registeredTool.name === 'generate_image');
 check('图片路由已注册', !!registeredRoute);
-check('参数只暴露 prompt/size/ratio', JSON.stringify(Object.keys(registeredTool.parameters.properties)) === '["prompt","size","ratio"]');
+check('参数暴露 prompt/size/ratio/reference_images', JSON.stringify(Object.keys(registeredTool.parameters.properties)) === '["prompt","size","ratio","reference_images"]', JSON.stringify(Object.keys(registeredTool.parameters.properties)));
 
 /* ---------- 走 generate_image 工具（离线） ---------- */
 const callId = 'call-test-1';
@@ -118,6 +135,48 @@ const second = await registeredTool.execute(
   { callId: 'call-test-1b', agent: { id: 'session-fake' }, signal: new AbortController().signal },
 );
 check('★ 同秒同提示词的第二次生成不覆盖第一张', second.files[0] !== value.files[0] && existsSync(second.files[0]), `${value.files[0]} vs ${second.files[0]}`);
+
+/* ---------- 参考图（图生图 / 改图） ---------- */
+const beforeEdit = requested.length;
+const edit = await registeredTool.execute(
+  { prompt: '把这张图改成日落', reference_images: ['latest'] },
+  { callId: 'call-edit-1', agent: { id: 'session-fake' }, signal: new AbortController().signal },
+);
+check('改图请求已发出', requested.length > beforeEdit);
+const editBody = requested[requested.length - 1].body;
+check(
+  '★ reference_images:["latest"] 把会话里的图作为 data URI 发出去',
+  Array.isArray(editBody?.extra_body?.image) && /^data:image\/png;base64,/.test(String(editBody.extra_body.image[0])),
+  JSON.stringify(editBody?.extra_body ?? null).slice(0, 120),
+);
+check('改图仍走同一条生成链路', edit.images.length === 1);
+
+await registeredTool.execute(
+  { prompt: '改成夜景', reference_images: ['att-ref-1'] },
+  { callId: 'call-edit-2', agent: { id: 'session-fake' }, signal: new AbortController().signal },
+);
+check('按 attachmentId 指定参考图', /^data:image\/png;base64,/.test(String(requested[requested.length - 1].body?.extra_body?.image?.[0])));
+
+let refErr = null;
+try {
+  await registeredTool.execute(
+    { prompt: '改成夜景', reference_images: ['nope'] },
+    { callId: 'call-edit-3', agent: { id: 'session-fake' }, signal: new AbortController().signal },
+  );
+} catch (error) {
+  refErr = error;
+}
+check('★ 找不到参考图时报错，不静默退回文生图', !!refErr && /找不到参考图/.test(String(refErr.message)), String(refErr?.message));
+
+/* ---------- 落盘目录必须在工作区内 ---------- */
+let escapeErr = null;
+try {
+  resolveSaveDir(workDir, '../outside');
+} catch (error) {
+  escapeErr = error;
+}
+check('★ saveDir 不能跳出会话工作区', !!escapeErr && /工作区内/.test(String(escapeErr.message)), String(escapeErr?.message));
+check('saveDir 允许嵌套子目录', resolveSaveDir(workDir, 'a/b') === join(workDir, 'a', 'b'));
 
 /* ---------- 失败路径：空提示词 ---------- */
 let threw = null;

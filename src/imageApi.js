@@ -11,6 +11,9 @@
  * ⚠️ 本文件不绑定任何服务商：baseUrl / model 全部来自配置，空值直接报错，
  *    绝不回落到写死的内网/商业端点。
  */
+import { redactSecrets } from './redact.js';
+import { GenerationTimeoutError, transportFailure, withGenerationTimeout } from './diagnostics.js';
+
 export const DEFAULT_BASE_URL = '';
 export const DEFAULT_MODEL = '';
 export const IMAGE_SIZES = ['1K', '2K', '3K', '4K'];
@@ -79,34 +82,46 @@ export async function generateImages(options) {
   if (asBase64) payload.return_base64 = true;
   if (Number.isFinite(count) && count > 1) payload.n = Math.min(4, Math.trunc(count));
 
-  const timeout = AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined;
-  const composed = signal && timeout && AbortSignal.any ? AbortSignal.any([signal, timeout]) : signal || timeout;
-
+  /* 看门狗自己判超时（而不是靠 AbortSignal.timeout）：只有这样才能把
+     「我们的超时」和「用户取消」分开，并在超时时提示上游可能已扣费。 */
+  const startedAt = Date.now();
   let response;
   try {
-    response = await fetchImpl(joinUrl(baseUrl, '/v1/images/generations'), {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: composed,
-    });
+    response = await withGenerationTimeout(timeoutMs, signal, combined =>
+      fetchImpl(joinUrl(baseUrl, '/v1/images/generations'), {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: combined,
+      }),
+    );
   } catch (error) {
     /* 自己抛的（例如 baseUrl 没配）要原样透出，不能被包成"网络失败"。 */
     if (error instanceof ImageApiError) throw error;
-    if (error?.name === 'TimeoutError') throw new ImageApiError(`请求超时（${timeoutMs} ms）`, { code: 'TIMEOUT' });
+    if (error instanceof GenerationTimeoutError || error?.name === 'TimeoutError') {
+      throw new ImageApiError(error.message || `请求超时（${timeoutMs} ms）`, { code: 'TIMEOUT' });
+    }
+    if (signal?.aborted) throw new ImageApiError('请求已取消', { code: 'ABORTED' });
     if (error?.name === 'AbortError') throw new ImageApiError('请求已取消', { code: 'ABORTED' });
-    throw new ImageApiError(`请求失败：${error?.message || error}`, { code: 'NETWORK' });
+    throw new ImageApiError(transportFailure('图像 API 请求', startedAt, error, signal, [apiKey]).message, { code: 'NETWORK' });
   }
 
-  const text = await response.text();
+  let text;
+  try {
+    text = await response.text();
+  } catch (error) {
+    if (signal?.aborted) throw new ImageApiError('请求已取消', { code: 'ABORTED' });
+    throw new ImageApiError(transportFailure('读取响应', startedAt, error, signal, [apiKey]).message, { code: 'NETWORK' });
+  }
   let json;
   try {
     json = text ? JSON.parse(text) : {};
   } catch {
-    throw new ImageApiError(`响应不是 JSON（HTTP ${response.status}）：${text.slice(0, 300)}`, { status: response.status, code: 'BAD_JSON' });
+    throw new ImageApiError(`响应不是 JSON（HTTP ${response.status}）：${redactSecrets(text.slice(0, 300), apiKey)}`, { status: response.status, code: 'BAD_JSON' });
   }
   if (!response.ok) {
-    const detail = json?.error?.message || json?.message || text.slice(0, 300);
+    /* 中转站经常把请求头（含 key）原样回显在错误体里，进对话前必须打码 */
+    const detail = redactSecrets(String(json?.error?.message || json?.message || text.slice(0, 300)), apiKey);
     throw new ImageApiError(`服务返回 HTTP ${response.status}：${detail}`, { status: response.status, code: 'HTTP_ERROR', body: json });
   }
 
@@ -125,9 +140,18 @@ export async function generateImages(options) {
 
 /** 下载图片字节；返回 { data: Uint8Array, mediaType }。 */
 export async function downloadImage(url, { timeoutMs = 120000, signal, fetchImpl = fetch } = {}) {
-  const timeout = AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined;
-  const composed = signal && timeout && AbortSignal.any ? AbortSignal.any([signal, timeout]) : signal || timeout;
-  const response = await fetchImpl(url, { signal: composed });
+  const startedAt = Date.now();
+  let response;
+  try {
+    response = await withGenerationTimeout(timeoutMs, signal, combined => fetchImpl(url, { signal: combined }));
+  } catch (error) {
+    if (error instanceof ImageApiError) throw error;
+    if (error instanceof GenerationTimeoutError || error?.name === 'TimeoutError') {
+      throw new ImageApiError(`下载图片超时（${String(timeoutMs / 1000)} 秒）`, { code: 'TIMEOUT' });
+    }
+    if (signal?.aborted) throw new ImageApiError('请求已取消', { code: 'ABORTED' });
+    throw new ImageApiError(transportFailure('下载图片', startedAt, error, signal, []).message, { code: 'DOWNLOAD_FAILED' });
+  }
   if (!response.ok) throw new ImageApiError(`下载图片失败 HTTP ${response.status}`, { status: response.status, code: 'DOWNLOAD_FAILED' });
   const buffer = new Uint8Array(await response.arrayBuffer());
   const headerType = response.headers?.get?.('content-type');

@@ -9,8 +9,8 @@
  * 就渲染 GridReveal 动画，result 一到动画消失换成图片；工具描述明确要求模型"立刻调用、不写正文、
  * 不输出思考"，因此对话里没有命令、没有多余文字。不再注册任何斜杠命令。
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { generateImages, downloadImage, decodeBase64Image, DEFAULT_BASE_URL, DEFAULT_MODEL, IMAGE_RATIOS, IMAGE_SIZES } from './imageApi.js';
 import { resolveOptimizerTarget } from './optimize.js';
 import { withPromptEnhancement } from './promptOptimizer.js';
@@ -85,20 +85,115 @@ function extForMediaType(mediaType) {
 }
 
 /**
- * 原子落盘：`wx` 标志保证同一秒、同一提示词的两次生成不会互相覆盖，
- * 撞名就换序号（早先是 writeFileSync 直接覆盖，等同于静默丢图）。
+ * 落盘目录必须留在会话工作区内：saveDir 来自配置/设置页，写成 `../../x` 或绝对路径
+ * 就会把图写到工作区之外。这里做一次词法包含检查（`resolve` 后再比较相对路径），
+ * 与参考实现一样不接受任何跳出工作区的写法。
+ */
+export function resolveSaveDir(workspaceRoot, folder) {
+  const root = resolve(workspaceRoot);
+  const trimmed = String(folder || '').trim();
+  const dir = trimmed ? resolve(root, trimmed) : root;
+  const rel = relative(root, dir);
+  if (rel !== '' && (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel))) {
+    throw new Error(`图片保存目录「${folder}」必须留在会话工作区内（当前解析到 ${dir}）`);
+  }
+  return dir;
+}
+
+/**
+ * 原子落盘：先写同目录临时文件再 rename 到最终名，崩溃不会留下半张图；
+ * 同一秒、同一提示词的两次生成撞名就换序号（早先是直接覆盖，等同于静默丢图）。
  */
 function writeUniqueFile(dir, baseName, ext, data) {
+  mkdirSync(dir, { recursive: true });
   for (let n = 1; n <= 999; n++) {
     const file = join(dir, n === 1 ? `${baseName}.${ext}` : `${baseName}-${n}.${ext}`);
+    if (existsSync(file)) continue;
+    const tmp = `${file}.${process.pid}.${n}.tmp`;
     try {
-      writeFileSync(file, data, { flag: 'wx' });
+      writeFileSync(tmp, data);
+      renameSync(tmp, file);
       return file;
     } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
+      try {
+        unlinkSync(tmp);
+      } catch {
+        /* 临时文件可能还没建出来 */
+      }
+      throw error;
     }
   }
   throw new Error(`同名文件过多：${baseName}.${ext}`);
+}
+
+/** 参考图上限：张数与单张字节数（大图会把请求体撑爆，且多数服务本身有上限）。 */
+export const MAX_REFERENCE_IMAGES = 4;
+export const MAX_REFERENCE_BYTES = 8 * 1024 * 1024;
+
+/** 从会话消息里按顺序收集图片块。 */
+function collectImageRefs(messages) {
+  const refs = [];
+  for (const message of Array.isArray(messages) ? messages : []) {
+    for (const block of Array.isArray(message?.content) ? message.content : []) {
+      if (block && block.type === 'image' && block.attachment) refs.push(block.attachment);
+    }
+  }
+  return refs;
+}
+
+/**
+ * 把工具参数里的参考图说明解析成 data URI 数组（图生图 / 改图）。
+ *
+ *   "latest"      → 当前会话里最新一条带图消息中的所有图片
+ *   "<附件 id>"   → 会话里对应那张图
+ *
+ * 只读当前会话里已经存在的图：不读工作区路径（避免把任意文件读进请求），
+ * 也不接受 URL（避免把本机当代理去拉外部资源）。
+ */
+export async function resolveReferenceImages(service, specs, session, signal) {
+  const wanted = (Array.isArray(specs) ? specs : []).map(value => String(value || '').trim()).filter(Boolean);
+  if (wanted.length === 0) return [];
+  if (!session) throw new Error('参考图需要当前会话上下文：请在对话里先生成或上传一张图片');
+  const attachments = service.pick('attachments');
+  if (typeof attachments?.readImage !== 'function') throw new Error('当前宿主没有附件服务，无法读取参考图');
+  const messages = typeof session.deriveMessages === 'function' ? session.deriveMessages() : [];
+  const available = collectImageRefs(messages);
+  if (available.length === 0) throw new Error('当前会话里还没有图片：先生成或上传一张，再让我基于它修改');
+
+  const picked = [];
+  for (const spec of wanted) {
+    if (spec === 'latest') {
+      const newest = [...messages].reverse().find(message => Array.isArray(message?.content) && message.content.some(block => block?.type === 'image' && block.attachment));
+      for (const ref of collectImageRefs([newest])) picked.push(ref);
+      continue;
+    }
+    const hit = available.find(ref => String(ref.attachmentId) === spec);
+    if (!hit) throw new Error(`找不到参考图 ${spec}：只支持当前会话里已有的图片 id，或 "latest"`);
+    picked.push(hit);
+  }
+
+  const unique = [];
+  const seen = new Set();
+  for (const ref of picked) {
+    const id = String(ref.attachmentId);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    unique.push(ref);
+  }
+  if (unique.length > MAX_REFERENCE_IMAGES) throw new Error(`参考图最多 ${MAX_REFERENCE_IMAGES} 张（收到 ${unique.length} 张）`);
+
+  const out = [];
+  for (const ref of unique) {
+    const stored = await attachments.readImage(ref, signal);
+    const data = stored?.data;
+    if (!data || data.length === 0) throw new Error('参考图读取失败：附件内容为空');
+    if (data.length > MAX_REFERENCE_BYTES) {
+      throw new Error(`参考图过大（${(data.length / 1024 / 1024).toFixed(1)}MB，上限 ${MAX_REFERENCE_BYTES / 1024 / 1024}MB）`);
+    }
+    const mediaType = stored?.ref?.mediaType || ref.mediaType || 'image/png';
+    out.push(`data:${mediaType};base64,${Buffer.from(data).toString('base64')}`);
+  }
+  return out;
 }
 
 export const DEFAULT_CONFIG = {
@@ -252,7 +347,7 @@ export class ImageGenService {
 
   /** 优化 + 生成 + 落地。供工具 execute 使用。 */
   async run(request) {
-    const { prompt, size, ratio, count, noOptimize, asBase64, sessionId, signal, onStage, model: modelWanted } = request;
+    const { prompt, size, ratio, count, noOptimize, asBase64, sessionId, signal, onStage, model: modelWanted, referenceImages: referenceSpec } = request;
     const started = Date.now();
     if (!String(prompt || '').trim()) {
       throw new Error('请给出提示词，例如：一只趴在窗台的橘猫，午后阳光');
@@ -281,12 +376,16 @@ export class ImageGenService {
     const usedSize = size || chosen.size || this.config.size;
     const usedRatio = ratio || chosen.ratio || this.config.ratio;
     const usedCount = count || this.config.count;
+    /* 参考图在生成前解析成 data URI：解析失败（会话里没图 / 找不到 id / 超限）
+       必须直接报错，而不是静默退回文生图 —— 用户说的是"改这张图"。 */
+    const referenceImages = await resolveReferenceImages(this, referenceSpec, session, signal);
     const result = await this.generateImage(chosen, {
       prompt,
       size: usedSize,
       ratio: usedRatio,
       count: usedCount,
       asBase64: !!asBase64,
+      referenceImages: referenceImages.length > 0 ? referenceImages : undefined,
       signal,
       session,
       noOptimize,
@@ -326,8 +425,7 @@ export class ImageGenService {
         let file = null;
         if (this.config.saveFiles !== false && cwd) {
           try {
-            const dir = join(cwd, this.config.saveDir || DEFAULT_CONFIG.saveDir);
-            mkdirSync(dir, { recursive: true });
+            const dir = resolveSaveDir(cwd, this.config.saveDir || DEFAULT_CONFIG.saveDir);
             file = writeUniqueFile(dir, baseName, ext, bytes.data);
             files.push(file);
           } catch (error) {
@@ -356,7 +454,7 @@ export class ImageGenService {
       prompt,
       optimizedPrompt: optimized.prompt,
       optimizer: { via: optimized.via, provider: optimized.target?.provider, model: optimized.target?.model, error: optimized.error, ms: optimized.ms },
-      api: { model: chosen.model, name: chosen.name, kind: chosen.kind, baseUrl: chosen.baseUrl, size: usedSize, ratio: usedRatio, count: images.length },
+      api: { model: chosen.model, name: chosen.name, kind: chosen.kind, baseUrl: chosen.baseUrl, size: usedSize, ratio: usedRatio, count: images.length, references: referenceImages.length },
       images,
       files,
       failures,
@@ -631,13 +729,22 @@ export function applyCordis(ctx, config) {
       name: 'generate_image',
       description:
         '用 图像模型生成图片。用户要求画图/生图/配图/出海报时——包括只说“只生成图片”——必须**立刻调用本工具**：不要写任何正文，不要输出思考或计划，不要反问确认，参数从用户的话里直接取。' +
+        '用户要求“基于这张图改 / 换成… / 把图里的…改掉”这类改图请求时，同样立刻调用本工具，并把 reference_images 设为 ["latest"]（指当前会话里最新一张图）。' +
         '工具内部会自动把提示词优化后再送模型，所以你不需要替用户润色提示词。调用之后这一轮就结束了：不要再补任何总结文字（不要写“已生成几张”“画面/规格/文件”之类），聊天里只该出现生成动画和图片本身。',
       parameters: {
         type: 'object',
         properties: {
-          prompt: { type: 'string', description: '要生成的画面描述，直接采用用户给的画面内容（可原样照抄，不必润色）' },
+          prompt: { type: 'string', description: '要生成的画面描述，直接采用用户给的画面内容（可原样照抄，不必润色）；改图时写清楚要改哪里、改成什么' },
           size: { type: 'string', enum: IMAGE_SIZES, description: '输出档位，默认 2K' },
           ratio: { type: 'string', enum: IMAGE_RATIOS, description: '宽高比，默认 1:1' },
+          reference_images: {
+            type: 'array',
+            maxItems: MAX_REFERENCE_IMAGES,
+            items: { type: 'string' },
+            description:
+              '参考图（图生图/改图）。传 ["latest"] 表示用当前会话里最新一张图；也可以传会话里图片的 attachmentId。' +
+              '纯文生图时不要传这个参数。',
+          },
         },
         required: ['prompt'],
         additionalProperties: false,
@@ -681,6 +788,7 @@ export function applyCordis(ctx, config) {
             prompt: input.prompt,
             size: input.size,
             ratio: input.ratio,
+            referenceImages: input.reference_images,
             sessionId: exec?.agent?.id,
             signal: exec?.signal,
             onStage,
